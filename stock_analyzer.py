@@ -29,6 +29,8 @@ SUPPORTED MARKETS:
 from __future__ import annotations
 
 import sys
+import time
+import random
 import logging
 import argparse
 import warnings
@@ -147,24 +149,53 @@ class DataFetcher:
     def __init__(self, period_days: int = 90) -> None:
         self.period_days = period_days
 
+    @staticmethod
+    def _is_rate_limit(exc: Exception) -> bool:
+        """Return True when the exception looks like a Yahoo Finance rate limit."""
+        msg = str(exc).lower()
+        return any(k in msg for k in ("too many requests", "rate limit", "429", "throttl"))
+
+    def _fetch_with_retry(self, symbol: str, max_attempts: int = 4) -> Optional[pd.DataFrame]:
+        """
+        Call yf.Ticker.history() with exponential back-off on rate-limit errors.
+        Delays: 3 s, 6 s, 12 s (plus ±1 s jitter each time).
+        """
+        total_days = self.period_days + FETCH_EXTRA_DAYS
+        end   = datetime.now()
+        start = end - timedelta(days=total_days)
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                ticker = yf.Ticker(symbol)
+                df = ticker.history(
+                    start=start.strftime("%Y-%m-%d"),
+                    end=end.strftime("%Y-%m-%d"),
+                    auto_adjust=True,
+                )
+                return df  # success (may be empty — caller handles that)
+
+            except Exception as exc:
+                if self._is_rate_limit(exc) and attempt < max_attempts:
+                    delay = 3 * (2 ** (attempt - 1)) + random.uniform(-0.5, 1.0)
+                    console.print(
+                        f"[yellow]⚠ Rate limited by Yahoo Finance "
+                        f"(attempt {attempt}/{max_attempts - 1}). "
+                        f"Retrying in {delay:.0f}s…[/yellow]"
+                    )
+                    time.sleep(delay)
+                else:
+                    raise  # non-rate-limit error, or exhausted retries
+        return None  # unreachable, but satisfies type checker
+
     def fetch_stock_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """
-        Download OHLCV history for *symbol*.
+        Download OHLCV history for *symbol* with automatic retry on rate limits.
 
         Returns DataFrame or None on failure.
         """
         try:
-            total_days = self.period_days + FETCH_EXTRA_DAYS
-            end   = datetime.now()
-            start = end - timedelta(days=total_days)
-
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(
-                start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"),
-                auto_adjust=True,
-            )
-            if df.empty:
+            df = self._fetch_with_retry(symbol)
+            if df is None or df.empty:
                 logger.warning("No data returned for %s", symbol)
                 return None
 
@@ -177,7 +208,16 @@ class DataFetcher:
             return df
 
         except Exception as exc:
-            logger.error("Fetch failed for %s: %s", symbol, exc)
+            if self._is_rate_limit(exc):
+                console.print(
+                    f"[red]✗ Yahoo Finance rate limit reached for '{symbol}'. "
+                    "Please wait 30–60 seconds and try again.[/red]"
+                )
+            else:
+                logger.error("Fetch failed for %s: %s", symbol, exc)
+                console.print(
+                    f"[red]✗ Cannot fetch data for '{symbol}': {exc}[/red]"
+                )
             return None
 
     def get_stock_info(self, symbol: str) -> Dict[str, Any]:
