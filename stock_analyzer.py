@@ -6,7 +6,11 @@
 ================================================================================
 
 INSTALLATION (run once):
-    pip install yfinance pandas numpy rich matplotlib tqdm
+    pip install yfinance curl_cffi pandas numpy rich matplotlib tqdm
+
+    curl_cffi is REQUIRED by yfinance ≥ 0.2.52 for Yahoo Finance API access.
+    If you see "Yahoo API requires curl_cffi session", run:
+        pip install --upgrade yfinance curl_cffi
 
 USAGE:
     python stock_analyzer.py                           # Interactive mode
@@ -29,6 +33,7 @@ SUPPORTED MARKETS:
 from __future__ import annotations
 
 import sys
+import re
 import time
 import random
 import logging
@@ -54,6 +59,13 @@ if _MISSING:
     print(f"   Install:  pip install {' '.join(_MISSING)}\n")
     sys.exit(1)
 
+# curl_cffi is required by yfinance ≥ 0.2.52; warn early if absent
+try:
+    import curl_cffi  # noqa: F401
+    _CURL_CFFI_OK = True
+except ImportError:
+    _CURL_CFFI_OK = False
+
 import yfinance as yf
 
 from rich.console import Console
@@ -62,6 +74,15 @@ from rich.panel import Panel
 from rich import box
 from rich.rule import Rule
 from rich.progress import Progress, SpinnerColumn, TextColumn
+
+# Warn immediately if curl_cffi is absent (yfinance will fail at runtime)
+if not _CURL_CFFI_OK:
+    _early_console = Console()
+    _early_console.print(
+        "\n[bold yellow]⚠  curl_cffi not found.[/bold yellow] "
+        "yfinance ≥ 0.2.52 requires it for Yahoo Finance API access.\n"
+        "   Fix:  [bold]pip install --upgrade yfinance curl_cffi[/bold]\n"
+    )
 
 try:
     import matplotlib
@@ -146,14 +167,44 @@ class ComprehensiveSignal:
 class DataFetcher:
     """Fetches and validates OHLCV data from Yahoo Finance."""
 
+    # Valid ticker pattern: letters/digits, optional suffix like .HK/.SS/.SZ,
+    # indices (^GSPC), futures (GC=F), or hyphenated (BRK-B).  Max 20 chars.
+    _SYMBOL_RE = re.compile(r"^[A-Z0-9\^\-\.=]{1,20}$")
+
     def __init__(self, period_days: int = 90) -> None:
         self.period_days = period_days
+
+    @staticmethod
+    def validate_symbol(symbol: str) -> Tuple[bool, str]:
+        """
+        Check that *symbol* looks like a real ticker before hitting the network.
+
+        Returns (ok, error_message).
+        """
+        s = symbol.strip().upper()
+        if not s:
+            return False, "Symbol is empty."
+        if len(s) > 20:
+            return False, f"Symbol too long ({len(s)} chars). Max 20."
+        if not DataFetcher._SYMBOL_RE.match(s):
+            bad = [c for c in s if not re.match(r"[A-Z0-9\^\-\.=]", c)]
+            return False, (
+                f"Invalid characters in symbol: {bad!r}. "
+                "Expected format: AAPL · 0700.HK · 600519.SS · ^GSPC · BRK-B"
+            )
+        return True, ""
 
     @staticmethod
     def _is_rate_limit(exc: Exception) -> bool:
         """Return True when the exception looks like a Yahoo Finance rate limit."""
         msg = str(exc).lower()
         return any(k in msg for k in ("too many requests", "rate limit", "429", "throttl"))
+
+    @staticmethod
+    def _is_curl_cffi_error(exc: Exception) -> bool:
+        """Return True for the 'requires curl_cffi session' yfinance error."""
+        msg = str(exc).lower()
+        return "curl_cffi" in msg and "session" in msg
 
     def _fetch_with_retry(self, symbol: str, max_attempts: int = 4) -> Optional[pd.DataFrame]:
         """
@@ -191,12 +242,23 @@ class DataFetcher:
         """
         Download OHLCV history for *symbol* with automatic retry on rate limits.
 
+        Validates the symbol format before hitting the network.
         Returns DataFrame or None on failure.
         """
+        # ── Validate symbol format before any network call ────────────────────
+        ok, err = self.validate_symbol(symbol)
+        if not ok:
+            console.print(f"[red]✗ Invalid symbol '{symbol}': {err}[/red]")
+            return None
+
         try:
             df = self._fetch_with_retry(symbol)
             if df is None or df.empty:
                 logger.warning("No data returned for %s", symbol)
+                console.print(
+                    f"[red]✗ No data found for '{symbol}'. "
+                    "Verify the ticker (e.g. AAPL, 0700.HK, 600519.SS).[/red]"
+                )
                 return None
 
             df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
@@ -208,10 +270,16 @@ class DataFetcher:
             return df
 
         except Exception as exc:
-            if self._is_rate_limit(exc):
+            if self._is_curl_cffi_error(exc):
                 console.print(
-                    f"[red]✗ Yahoo Finance rate limit reached for '{symbol}'. "
-                    "Please wait 30–60 seconds and try again.[/red]"
+                    "[bold red]✗ curl_cffi session error from yfinance.[/bold red]\n"
+                    "   Your yfinance version requires curl_cffi. Fix with:\n"
+                    "   [bold]pip install --upgrade yfinance curl_cffi[/bold]"
+                )
+            elif self._is_rate_limit(exc):
+                console.print(
+                    f"[red]✗ Yahoo Finance rate limit for '{symbol}'. "
+                    "Wait 30–60 s and try again.[/red]"
                 )
             else:
                 logger.error("Fetch failed for %s: %s", symbol, exc)
@@ -1479,6 +1547,20 @@ class StockAnalyzer:
             if not symbols:
                 continue
 
+            # Validate each symbol before proceeding
+            valid_symbols: List[str] = []
+            for sym in symbols:
+                ok, err = DataFetcher.validate_symbol(sym)
+                if ok:
+                    valid_symbols.append(sym)
+                else:
+                    self.display.console.print(
+                        f"[red]✗ Skipping '{sym}': {err}[/red]"
+                    )
+            if not valid_symbols:
+                continue
+            symbols = valid_symbols
+
             try:
                 chart_ans = input("Generate chart? (y/[n]): ").strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -1702,7 +1784,17 @@ Examples:
         return
 
     if args.symbols:
-        syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        syms_raw = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        syms: List[str] = []
+        for s in syms_raw:
+            ok, err = DataFetcher.validate_symbol(s)
+            if ok:
+                syms.append(s)
+            else:
+                console.print(f"[red]✗ Invalid symbol '{s}': {err}[/red]")
+        if not syms:
+            console.print("[red]No valid symbols provided. Exiting.[/red]")
+            sys.exit(1)
         if len(syms) == 1:
             tool.analyse_symbol(syms[0], show_chart=args.chart)
         else:
